@@ -1,0 +1,35 @@
+name: Build worklog.exe
+
+on:
+  push:
+    paths:
+      - "worklog.py"
+      - ".github/workflows/build-exe.yml"
+  pull_request:
+    paths:
+      - "worklog.py"
+      - ".github/workflows/build-exe.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      # --console: the tool needs its console window to ask questions.
+      - name: Build exe
+        run: pyinstaller --onefile --console --name worklog worklog.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worklog-exe
+          path: dist/worklog.exe
+          if-no-files-found: error
