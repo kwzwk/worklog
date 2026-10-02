@@ -2,6 +2,10 @@ name: Build worklog.exe
 
 on:
   push:
+    branches: ["**"]
+    # Pushing a tag like v1.0.0 builds the exe and publishes a GitHub Release.
+    # (Path filters don't apply to tag pushes, so every v* tag releases.)
+    tags: ["v*"]
     paths:
       - "worklog.py"
       - ".github/workflows/build-exe.yml"
@@ -33,3 +37,32 @@ jobs:
           name: worklog-exe
           path: dist/worklog.exe
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the build attestation
+      attestations: write  # store the build attestation
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: worklog-exe
+
+      - name: Write checksum
+        run: sha256sum worklog.exe > worklog.exe.sha256
+
+      # Signed record that this exe was built by this workflow from this
+      # commit. Check it with: gh attestation verify worklog.exe -R kwzwk/worklog
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: worklog.exe
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            worklog.exe
+            worklog.exe.sha256
+          generate_release_notes: true
