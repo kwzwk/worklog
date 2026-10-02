@@ -27,8 +27,10 @@ from datetime import datetime
 INTERVAL_MINUTES = 60
 
 # Folder where the daily log files are written. It is created if missing.
-# (The leading r"" means backslashes are taken literally — handy on Windows.)
-LOG_DIR = r"C:\Users\KZ1317\Desktop\TimeLogger"
+# By default it's a TimeLogger folder on the current user's Desktop. To use a
+# fixed folder instead, write it like r"D:\Logs\TimeLogger" (the leading r""
+# means backslashes are taken literally — handy on Windows).
+LOG_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "TimeLogger")
 
 # The question you get asked.
 PROMPT_TEXT = "What have you worked on?"
