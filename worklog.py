@@ -195,6 +195,23 @@ def append_to_log(text):
         f.write(text)
 
 
+def save_with_retry(what, write, *args):
+    """Run write(*args). If the file can't be written (most often the CSV is
+    open in Excel, which locks it), ask to close it and retry instead of
+    failing. Returns True if it was saved."""
+    while True:
+        try:
+            write(*args)
+            return True
+        except OSError as e:
+            if not messagebox.askretrycancel(
+                    "Work-log",
+                    f"Couldn't save the {what}:\n{e}\n\n"
+                    "If the file is open (e.g. the CSV in Excel), close it "
+                    "and click Retry."):
+                return False
+
+
 def load_projects():
     try:
         with open(PROJECTS_FILE, "r", encoding="utf-8-sig", errors="replace") as f:
@@ -445,8 +462,15 @@ def do_prompt(reason):
         nonproject_minutes += delta_min        # worked, just not on a project
     last_entry_time = end
 
-    write_entry(start, end, answer, projects, kind)
-    write_csv_rows(start, end, answer, projects, kind)
+    saved_log = save_with_retry("daily log", write_entry,
+                                start, end, answer, projects, kind)
+    save_with_retry("weekly CSV", write_csv_rows,
+                    start, end, answer, projects, kind)
+    if not saved_log and answer.strip():
+        # Don't lose what was typed. (Ctrl+C copies a message box's text.)
+        messagebox.showwarning(
+            "Work-log", "This entry was NOT saved to the daily log:\n\n"
+                        f"{hhmm(start)}\u2013{hhmm(end)}  {answer}")
 
     # Remember the last real WORK task for "Same as before" (not breaks).
     if kind == "work" and (projects or answer.strip()):
@@ -492,8 +516,9 @@ def finalize_and_quit():
     trailing = (end - last_entry_time).total_seconds() / 60.0
     if trailing > 0:
         nonproject_minutes += trailing
-    append_to_log("\n**Session ended:** " + hhmm(end) + "\n\n"
-                  + "\n".join(build_summary(end)) + "\n")
+    save_with_retry("work-day summary", append_to_log,
+                    "\n**Session ended:** " + hhmm(end) + "\n\n"
+                    + "\n".join(build_summary(end)) + "\n")
     try:
         if icon is not None:
             icon.stop()
@@ -579,6 +604,27 @@ def build_tray_icon():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def poll():
+    """Run one poll step and schedule the next. An unexpected error is shown
+    instead of silently stopping the timer and the tray menu."""
+    global next_due
+    try:
+        if not poll_step():
+            return                       # quitting: stop the poll chain
+    except Exception as e:
+        # Restart the countdown so a failing prompt doesn't re-fire at once.
+        next_due = now() + interval
+        try:
+            messagebox.showerror("Work-log",
+                                 f"Unexpected error:\n{type(e).__name__}: {e}"
+                                 "\n\nWork-log keeps running.")
+        except Exception:
+            pass
+    root.after(POLL_MS, poll)
+
+
+def poll_step():
+    """Handle queued tray commands and the scheduled prompt. Returns False
+    when the program is quitting."""
     global paused, next_due, interval, interval_minutes
 
     # 1) Handle any queued tray commands first.
@@ -607,7 +653,7 @@ def poll():
             open_path(cmd[1])
         elif name == "quit":
             finalize_and_quit()
-            return                       # stop the poll chain
+            return False
 
     # 2) Scheduled auto-prompt (skipped while paused).
     if not paused and now() >= next_due:
@@ -615,8 +661,7 @@ def poll():
         while next_due <= now():         # catch up if a long answer overran
             next_due += interval
 
-    # 3) Schedule the next check.
-    root.after(POLL_MS, poll)
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -663,4 +708,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        _r = tk.Tk(); _r.withdraw()
+        messagebox.showerror("Work-log",
+                             f"Work-log couldn't start:\n"
+                             f"{type(e).__name__}: {e}")
+        sys.exit(1)

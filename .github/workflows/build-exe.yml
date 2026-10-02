@@ -33,12 +33,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+      - name: Install PyInstaller and dependencies
+        run: python -m pip install --upgrade pip pyinstaller pystray pillow
 
-      # --console: the tool needs its console window to ask questions.
+      # --noconsole: it's a tray app with pop-ups, so no console window.
+      # pystray picks its backend at runtime, so name the Windows one.
       - name: Build exe
-        run: pyinstaller --onefile --console --name worklog worklog.py
+        run: pyinstaller --onefile --noconsole --hidden-import pystray._win32 --name worklog worklog.py
 
       - uses: actions/upload-artifact@v4
         with:
