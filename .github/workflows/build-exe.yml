@@ -18,8 +18,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      SIGN: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,36 +31,6 @@ jobs:
       # --console: the tool needs its console window to ask questions.
       - name: Build exe
         run: pyinstaller --onefile --console --name worklog worklog.py
-
-      # Code signing via SignPath Foundation (free for open source). Runs
-      # only for release tags, and only once the SIGNPATH_API_TOKEN secret
-      # and SIGNPATH_ORGANIZATION_ID variable are set; until then the exe
-      # is released unsigned.
-      - name: Upload unsigned exe for signing
-        id: unsigned
-        if: env.SIGN == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: worklog-exe-unsigned
-          path: dist/worklog.exe
-          if-no-files-found: error
-
-      - name: Sign exe with SignPath
-        if: env.SIGN == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'worklog' }}
-          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
-          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
-          wait-for-completion: true
-          output-artifact-directory: signed
-
-      - name: Use signed exe
-        if: env.SIGN == 'true'
-        shell: bash
-        run: cp signed/worklog.exe dist/worklog.exe
 
       - uses: actions/upload-artifact@v4
         with:
