@@ -3,9 +3,6 @@ name: Build worklog.exe
 on:
   push:
     branches: ["**"]
-    # Pushing a tag like v1.0.0 builds the exe and publishes a GitHub Release.
-    # (Path filters don't apply to tag pushes, so every v* tag releases.)
-    tags: ["v*"]
     paths:
       - "worklog.py"
       - ".github/workflows/build-exe.yml"
@@ -13,13 +10,24 @@ on:
     paths:
       - "worklog.py"
       - ".github/workflows/build-exe.yml"
+  # Publishing a GitHub Release (any tag name) builds the exe and attaches it.
+  release:
+    types: [published]
+  # Run manually; give a release's tag to (re)attach the exe to that release.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach the exe to (leave empty to just build)"
+        required: false
+        default: ""
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -40,10 +48,10 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'release' || inputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
-      contents: write      # create the release
+      contents: write      # attach files to the release
       id-token: write      # sign the build attestation
       attestations: write  # store the build attestation
     steps:
@@ -62,6 +70,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          overwrite_files: true
           files: |
             worklog.exe
             worklog.exe.sha256
