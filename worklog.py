@@ -33,11 +33,25 @@ LOG_DIR = r"C:\Users\KZ1317\Desktop\TimeLogger"
 # The question you get asked.
 PROMPT_TEXT = "What have you worked on?"
 
+# Beep (and on Windows, flash the window's taskbar button) when the automatic
+# prompt appears, so you notice it even if the window is behind others.
+ALERT_ON_PROMPT = True
+
 # ==========================================================================
 # Nothing below here normally needs editing.
 # ==========================================================================
 
 INTERVAL_SECONDS = INTERVAL_MINUTES * 60
+
+QUIT_COMMANDS = ("quit", "exit", "q")
+
+# A line that arrives this soon after the automatic prompt appears was typed
+# before you could have read it, so it's treated as a command, not an answer.
+TYPE_AHEAD_SECONDS = 1.5
+
+# An empty line this soon after saving an entry is a stray extra Enter and is
+# ignored instead of starting a new manual log.
+STRAY_ENTER_SECONDS = 1.0
 
 # The log file path is decided once, when the program starts, so a single
 # run always writes to the file for the day you started on.
@@ -139,12 +153,49 @@ def stdin_reader(line_queue):
         line_queue.put(line.rstrip("\n").rstrip("\r"))
 
 
-def collect_answer(line_queue):
+def alert():
+    """Get your attention when the automatic prompt appears: beep, and on
+    Windows flash the console window's taskbar button until it's focused."""
+    if not ALERT_ON_PROMPT:
+        return
+    sys.stdout.write("\a")
+    sys.stdout.flush()
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT),
+                        ("hwnd", wintypes.HWND),
+                        ("dwFlags", wintypes.DWORD),
+                        ("uCount", wintypes.UINT),
+                        ("dwTimeout", wintypes.DWORD)]
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            FLASHW_ALL = 0x3          # flash caption and taskbar button
+            FLASHW_TIMERNOFG = 0xC    # ...until the window comes to front
+            info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd,
+                              FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0)
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:
+        pass  # the beep is enough if flashing isn't available
+
+
+def collect_answer(line_queue, type_ahead_until=None):
     """Print the question and gather a (possibly multi-line) answer.
 
     The user types one or more lines and finishes by pressing Enter on an
     empty line. An immediately-empty answer comes back as an empty list.
-    Returns the list of answer lines.
+
+    If `type_ahead_until` is given, lines arriving before that time are
+    treated as commands typed before the prompt appeared: a quit command
+    cancels the prompt, Enter/'log' is ignored, anything else is kept as
+    part of the answer.
+
+    Returns (answer_lines, quit_requested).
     """
     print()
     print(PROMPT_TEXT)
@@ -159,18 +210,42 @@ def collect_answer(line_queue):
         except queue.Empty:
             continue
         if line is None:          # EOF
+            line_queue.put(None)  # leave it for the main loop to see too
             break
+        if (not answer and type_ahead_until is not None
+                and time.monotonic() < type_ahead_until):
+            cmd = line.strip().lower()
+            if cmd in QUIT_COMMANDS:
+                return [], True
+            if cmd in ("", "log"):
+                continue
         if line.strip() == "":    # blank line ends the answer
             break
         answer.append(line)
-    return answer
+    return answer, False
 
 
 def do_log(line_queue, kind):
     """Ask the question, write the entry, and confirm on screen.
-    `kind` is just a label, e.g. 'manual' or 'automatic'."""
-    ts = write_entry(collect_answer(line_queue))
+    `kind` is 'manual' or 'automatic'. Returns True if the user typed a quit
+    command just as the automatic prompt appeared."""
+    if kind == "automatic":
+        alert()
+        lines, quit_requested = collect_answer(
+            line_queue, time.monotonic() + TYPE_AHEAD_SECONDS)
+    else:
+        lines, quit_requested = collect_answer(line_queue)
+
+    if quit_requested:
+        return True
+    if not lines and kind == "manual":
+        # You asked to log and then didn't type anything: nothing to record.
+        print("  Nothing logged.")
+        return False
+
+    ts = write_entry(lines)
     print("  Logged at " + ts + " (" + kind + ").")
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -211,6 +286,9 @@ def main():
     # isn't thrown off by the system clock changing.
     next_due = time.monotonic() + INTERVAL_SECONDS
 
+    # When the last prompt was finished, to spot a stray extra Enter.
+    last_prompt_done = float("-inf")
+
     print_banner()
 
     try:
@@ -226,7 +304,10 @@ def main():
                 # 1) Has the automatic timer come due?
                 if time.monotonic() >= next_due:
                     print()                      # finish the "> " line
-                    do_log(line_queue, "automatic")
+                    if do_log(line_queue, "automatic"):
+                        command = "quit"
+                        break
+                    last_prompt_done = time.monotonic()
                     # Reschedule the NEXT automatic prompt. (Only the timer
                     # itself moves this — manual logs never touch it.)
                     next_due = time.monotonic() + INTERVAL_SECONDS
@@ -247,12 +328,16 @@ def main():
                 break
 
             cmd = command.strip().lower()
-            if cmd in ("quit", "exit", "q"):
+            if cmd in QUIT_COMMANDS:
                 break
+            elif cmd == "" and (time.monotonic() - last_prompt_done
+                                < STRAY_ENTER_SECONDS):
+                continue  # stray extra Enter right after saving
             elif cmd in ("", "log"):
                 # Manual trigger. NOTE: we deliberately do NOT change
                 # next_due here, so the regular timer keeps its schedule.
                 do_log(line_queue, "manual")
+                last_prompt_done = time.monotonic()
             else:
                 print("  Unknown command. Press Enter or type 'log' to log; "
                       "type 'quit' to exit.")
