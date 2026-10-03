@@ -4,12 +4,16 @@ Work-log timer — a background system-tray utility for logging what you work on
 
 Runs quietly as a tray icon (down by the clock). Every INTERVAL_MINUTES a popup
 asks "What have you worked on?", lets you tick the project(s) and task(s) you
-worked on, and appends a line to a daily Markdown .txt log and a weekly CSV.
-Right-click the tray icon to log on demand, pause, manage tasks, open the files,
-or quit.
+worked on, and records the time in a monthly CSV. Right-click the tray icon to
+log on demand, pause, manage tasks, create a monthly report, or quit.
 
-Markdown entry format:   * HH:MM–HH:MM - Project Name - Entry text
-On quit it appends a work-day summary (hours per project and task) to the log.
+REPORTS: "Create report…" builds an Excel workbook for a month: totals for the
+1st–15th, the 16th–end and the whole month, hours per project and per task, and
+a sheet per day and per week.
+
+DAILY LOG (optional, see WRITE_DAILY_LOG): a readable Markdown .txt diary per
+day with a work-day summary at the end.
+    Entry format:   * HH:MM–HH:MM - Project Name - Entry text
 
 NEW DAY: when the date changes, the day is closed automatically at your last
 activity (so a forgotten evening isn't counted as work) and a new day's log is
@@ -24,13 +28,13 @@ you worked on (their time is tracked) or mark them done. Open tasks stay in the
 list from day to day until they're done.
 
 PATHS: everything lives next to the program itself (the .py file, or the .exe if
-you build one) — no hard-coded user path. Daily logs and weekly CSVs go in a
-"log" subfolder; projects.txt and tasks.csv sit in the main folder next to the
-program.
+you build one) — no hard-coded user path. Monthly CSVs, reports and daily logs
+(if switched on) go in a "log" subfolder; projects.txt and tasks.csv sit in the
+main folder next to the program.
 
 REQUIREMENTS (beyond the Python standard library):
-    pip install pystray pillow
-Both bundle fine into a PyInstaller .exe. Build it WINDOWLESS (--noconsole) —
+    pip install pystray pillow openpyxl
+All bundle fine into a PyInstaller .exe. Build it WINDOWLESS (--noconsole) —
 see build_exe.bat.
 """
 
@@ -115,8 +119,14 @@ RESET_TIMER_ON_MANUAL_LOG = True
 # was a break. (Uses Windows' last-input time; elsewhere it's switched off.)
 IDLE_MINUTES = 30
 
-# Daily log files (and weekly CSVs) go in a "log" subfolder next to the program.
+# Monthly CSVs, reports and daily logs go in a "log" subfolder next to the
+# program.
 LOG_DIR = os.path.join(BASE_DIR, "log")
+
+# Also write a readable Markdown diary per day (worklog_YYYY-MM-DD.txt) with a
+# work-day summary at the end. Everything is in the monthly CSV and the report
+# either way.
+WRITE_DAILY_LOG = False
 
 # Project list, in the main folder next to the program. One project per line.
 # Blank lines and lines starting with '#' are ignored. Re-read live — edits take
@@ -148,12 +158,19 @@ CSV_DELIMITER = ";"
 # on double-click. Leave True unless a downstream tool dislikes the BOM.
 CSV_WRITE_BOM = True
 
+# Decimal separator for the Hours column. "," suits a German/European Excel
+# (which would read 7.5 as a date); use "." for an English Excel.
+CSV_DECIMAL = ","
+
 # CSV column headers. These become the SharePoint list's column names on import,
 # so they're kept clean (no spaces/punctuation) for tidy internal names.
-# A weekly file started before the "Task" column existed keeps its old columns
-# until the next week's file begins.
-CSV_HEADERS = ["Date", "Start", "End", "Duration_min", "Project", "Entry",
-               "Task"]
+# One row per project/task share of each logged block, so summing Hours by
+# any column (project, task, week, ...) always adds up.
+CSV_HEADERS = ["Date", "Week", "Weekday", "Start", "End", "Hours", "Type",
+               "Project", "Task_ID", "Task", "Note"]
+
+# Label used for time worked without a project ticked.
+NONPROJECT = "(non-project work)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,12 +251,14 @@ def log_path_for(dt):
 
 
 def csv_path_for(dt):
-    """Weekly CSV path, e.g. ...\\log\\worklog_2026-W22.csv (ISO weeks)."""
-    iso_year, iso_week, _ = dt.isocalendar()
-    return os.path.join(LOG_DIR, f"worklog_{iso_year}-W{iso_week:02d}.csv")
+    """Monthly CSV path, e.g. ...\\log\\worklog_2026-10.csv"""
+    return os.path.join(LOG_DIR, "worklog_" + dt.strftime("%Y-%m") + ".csv")
 
 
 def append_to_log(text):
+    """Append to today's daily log (only if WRITE_DAILY_LOG is on)."""
+    if not WRITE_DAILY_LOG:
+        return
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(text)
 
@@ -382,15 +401,11 @@ def task_total_minutes(t):
 
 
 def log_task_event(event, t, extra=""):
-    """Record a task change (ADDED, DONE, ...) in the daily log and weekly CSV."""
+    """Record a task change (ADDED, DONE, ...) in the daily log. (tasks.csv
+    itself keeps each task's created and done dates.)"""
     ensure_session()
-    at = now()
     save_with_retry("daily log", append_to_log,
-                    f"* {hhmm(at)} - TASK {event} - {task_label(t)}{extra}\n")
-    save_with_retry("weekly CSV", write_csv_rows, at, at,
-                    f"TASK {event}: {t['Task']}{extra}",
-                    [t["Project"]] if t["Project"] else [], "event",
-                    task_label(t))
+                    f"* {hhmm()} - TASK {event} - {task_label(t)}{extra}\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,71 +453,85 @@ def write_entry(start, end, answer_text, projects, kind, tasks_text=""):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Writing to the weekly CSV
+# Splitting a block's time, and writing it to the monthly CSV
 # ─────────────────────────────────────────────────────────────────────────────
 
-def csv_header_of(path):
-    """The column headers of an existing CSV file."""
-    try:
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            return next(csv.reader(f, delimiter=CSV_DELIMITER), [])
-    except OSError:
-        return CSV_HEADERS
+def allocate(minutes, projects, tasks):
+    """Split a block's minutes into (project, task or None, minutes) shares.
 
+    Every ticked task, and every ticked project without a ticked task of its
+    own, gets an equal share. A task's share goes to its project when that
+    project is ticked; otherwise (no project, or you unticked it because the
+    task was done for another project) it goes to the ticked projects that have
+    no task of their own (or to all ticked projects), or to non-project work if
+    no project is ticked.
 
-def write_csv_rows(start, end, answer_text, projects, kind, tasks_text=""):
-    """Append rows to the weekly CSV, optimized for Excel and SharePoint import.
-
-    Columns (see CSV_HEADERS): Date, Start, End, Duration_min, Project, Entry,
-    Task.
-    - Date is ISO YYYY-MM-DD (the format SharePoint date columns expect).
-    - Duration_min is a plain number with a '.' decimal (invariant), so it imports
-      as a real Number, not text. Split evenly across projects so the column sums
-      to total time.
-    - One row per project; breaks → 'BREAK', untracked work → '(non-project work)',
-      so a pivot / grouping on Project cleanly separates all three categories.
-    - Task events (kind 'event': added, done, ...) are rows with duration 0, so
-      they never change the totals; 'TASK' is their Project if they have none.
-    - The csv module quotes any field containing the delimiter, quotes or newlines
-      (RFC 4180), so commas in your notes never break the columns.
+    Example, 60 min: task T-001 [Alpha] + projects Alpha and Beta ticked
+    → Alpha 30 (T-001), Beta 30.
     """
-    path = csv_path_for(end)
+    projects = list(projects)
+    own = [t for t in tasks if t["Project"] and t["Project"] in projects]
+    floating = [t for t in tasks if t not in own]
+    have_task = {t["Project"] for t in own}
+    bare = [p for p in projects if p not in have_task]
+
+    units = [([t["Project"]], t) for t in own]
+    if floating:
+        targets = bare or projects or [NONPROJECT]
+        units += [(targets, t) for t in floating]
+    else:
+        units += [([p], None) for p in bare]
+    if not units:
+        units = [([NONPROJECT], None)]
+
+    share = minutes / len(units)
+    return [(p, t, share / len(targets))
+            for targets, t in units for p in targets]
+
+
+def fmt_hours(minutes):
+    """Hours with 2 decimals and the configured decimal separator."""
+    return f"{minutes / 60:.2f}".replace(".", CSV_DECIMAL)
+
+
+def write_csv_rows(start, end, answer_text, kind, shares):
+    """Append a block to the monthly CSV, optimized for Excel and SharePoint.
+
+    One row per (project, task) share from allocate(), so summing Hours by any
+    column adds up. Type is Work, Non-project or Break.
+    - Date is ISO YYYY-MM-DD (the format SharePoint date columns expect).
+    - Week is the ISO week (e.g. 2026-W40); Weekday is Mon…Sun.
+    - The csv module quotes any field containing the delimiter, quotes or newlines
+      (RFC 4180), so semicolons in your notes never break the columns.
+    """
+    path = csv_path_for(start)
     file_existed = os.path.exists(path)
-    with_task_column = "Task" in (csv_header_of(path) if file_existed
-                                  else CSV_HEADERS)
 
     # Flatten the note to a single line (no embedded newlines) for clean cells.
-    cell = answer_text.replace("\r\n", "\n").replace("\n", " | ").strip() \
-        or "(no entry)"
-
-    total_min = max(0.0, (end - start).total_seconds() / 60.0)
-    if kind == "break":
-        label_list = ["BREAK"]
-    elif kind == "event":
-        label_list = projects or ["TASK"]
-        total_min = 0.0
-    elif projects:
-        label_list = projects
-    else:
-        label_list = ["(non-project work)"]
-    share = total_min / len(label_list)
-    # Whole numbers as "60", fractional as "30.5" — tidy and numeric either way.
-    dur = f"{share:.2f}".rstrip("0").rstrip(".")
+    note = answer_text.replace("\r\n", "\n").replace("\n", " | ").strip()
+    iso_year, iso_week, _ = start.isocalendar()
+    fixed = [start.strftime("%Y-%m-%d"), f"{iso_year}-W{iso_week:02d}",
+             start.strftime("%a"), hhmm(start), hhmm(end)]
 
     # newline="" prevents blank rows; csv.writer then emits RFC-4180 \r\n.
     with open(path, "a", encoding="utf-8", newline="") as f:
         if not file_existed and CSV_WRITE_BOM:
-            f.write("﻿")                       # UTF-8 BOM → Excel encoding
+            f.write("\ufeff")                       # UTF-8 BOM → Excel encoding
         writer = csv.writer(f, delimiter=CSV_DELIMITER,
                             quoting=csv.QUOTE_MINIMAL)
         if not file_existed:
             writer.writerow(CSV_HEADERS)
-        date_str = end.strftime("%Y-%m-%d")         # ISO date
-        for p in label_list:
-            row = [date_str, hhmm(start), hhmm(end), dur, p, cell]
-            if with_task_column:
-                row.append(tasks_text)
-            writer.writerow(row)
+        for project, task, minutes in shares:
+            if kind == "break":
+                row_type, project = "Break", ""
+            elif project == NONPROJECT:
+                row_type = "Non-project"
+            else:
+                row_type = "Work"
+            writer.writerow(fixed + [
+                fmt_hours(minutes), row_type, project,
+                task["ID"] if task else "", task["Task"] if task else "",
+                note])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -626,7 +655,8 @@ def show_prompt_dialog(reason, end=None):
                                                   pady=(0, 10))
 
     # Open tasks: tick the ones you worked on (their time is tracked, and their
-    # project counts as ticked) and/or mark them done.
+    # project gets ticked too — untick it if the task was for another project)
+    # and/or mark them done.
     task_vars = {}
     if tasks:
         tk.Label(dlg, text="Task(s) worked on:"
@@ -649,16 +679,43 @@ def show_prompt_dialog(reason, end=None):
             ttk.Checkbutton(row, text="done", variable=done
                             ).pack(side="right", padx=(12, 0))
 
-    # Hint so it's clear what happens with no project ticked. "covers the last
-    # N min" is the REAL gap since the previous entry (so a manual log shows the
-    # true elapsed time, not the fixed interval).
+    # Live preview of how the time will be recorded (see allocate()), and a
+    # hint. "covers the last N min" is the REAL gap since the previous entry
+    # (so a manual log shows the true elapsed time, not the fixed interval).
     elapsed_min = max(0, int(round(
         (shown_end - last_entry_time).total_seconds() / 60)))
+    split_label = tk.Label(dlg, text="", justify="left", wraplength=520)
+    split_label.pack(anchor="w", padx=14, pady=(0, 2))
     tk.Label(dlg,
              text=f"Tip: covers the last {elapsed_min} min · "
                   "no project ticked = non-project work · "
                   "use Break for time off.",
              fg="grey").pack(anchor="w", padx=14, pady=(0, 6))
+
+    def update_preview(*_):
+        ticked = [n for n, v in vars_by_name.items() if v.get()]
+        ticked_tasks = [t for t in tasks if task_vars[t["ID"]][0].get()]
+        parts = []
+        for project, t, minutes in allocate(elapsed_min, ticked, ticked_tasks):
+            part = f"{project} {fmt_hm(minutes)}"
+            if t is not None:
+                part += f" ({t['ID']})"
+            parts.append(part)
+        split_label.config(text="Recorded as: " + " · ".join(parts))
+
+    def task_ticked(t, worked):
+        # Ticking a task ticks its project (you can untick it again).
+        if worked.get() and t["Project"] in vars_by_name:
+            vars_by_name[t["Project"]].set(True)
+        update_preview()
+
+    for var in vars_by_name.values():
+        var.trace_add("write", update_preview)
+    for t in tasks:
+        worked = task_vars[t["ID"]][0]
+        worked.trace_add("write",
+                         lambda *_a, t=t, worked=worked: task_ticked(t, worked))
+    update_preview()
 
     result = {"answer": "", "projects": [], "kind": "work",
               "tasks": [], "done": []}
@@ -801,59 +858,67 @@ def do_prompt(reason, end=None):
 
 def log_block(start, end, answer, projects, kind, task_ids=(), done_ids=()):
     """Account the time from start to end, update the tasks worked on / done,
-    and write the entry to the markdown log and the weekly CSV."""
+    and write the entry to the monthly CSV (and the daily log, if on)."""
     global entries_count, last_entry_time, nonproject_minutes, break_minutes
 
     end = max(end, start)
     delta_min = (end - start).total_seconds() / 60.0
 
-    # Tasks: split the block's time across the tasks ticked, add it to their
-    # running totals in tasks.csv, and mark the ones ticked "done".
+    # Split the block into project/task shares (see allocate()), add each
+    # task's share to its running total in tasks.csv, and mark the ones ticked
+    # "done".
     worked, done = [], []
     if kind == "work" and (task_ids or done_ids):
         def change(tasks):
             by_id = {t["ID"]: t for t in tasks}
             w = [by_id[i] for i in task_ids if i in by_id]
-            share = delta_min / len(w) if w else 0.0
-            for t in w:
-                t["Minutes"] = str(task_total_minutes(t) + int(round(share)))
-                task_minutes[t["ID"]] = task_minutes.get(t["ID"], 0.0) + share
             d = [by_id[i] for i in done_ids
                  if i in by_id and by_id[i]["Status"] != "done"]
+            shares = allocate(delta_min, projects, w)
+            for _p, t, minutes in shares:
+                if t is not None:
+                    t["Minutes"] = str(task_total_minutes(t)
+                                       + int(round(minutes)))
+                    task_minutes[t["ID"]] = (task_minutes.get(t["ID"], 0.0)
+                                             + minutes)
             for t in d:
                 t["Status"] = "done"
                 t["Done"] = end.strftime("%Y-%m-%d")
                 tasks_done_today.append(t["ID"])
-            return w, d
-        _saved, (worked, done) = change_tasks(change)
-        # A task's project counts as ticked.
-        for t in worked:
-            if t["Project"] and t["Project"] not in projects:
-                projects = list(projects) + [t["Project"]]
-
-    if kind == "break":
-        break_minutes += delta_min
-    elif projects:
-        share = delta_min / len(projects)
-        for p in projects:
-            project_minutes[p] = project_minutes.get(p, 0.0) + share
+            return w, d, shares
+        _saved, (worked, done, shares) = change_tasks(change)
+    elif kind == "break":
+        shares = [("", None, delta_min)]
     else:
-        nonproject_minutes += delta_min        # worked, just not on a project
+        shares = allocate(delta_min, projects, [])
+
+    for project, _t, minutes in shares:
+        if kind == "break":
+            break_minutes += minutes
+        elif project == NONPROJECT:
+            nonproject_minutes += minutes      # worked, just not on a project
+        else:
+            project_minutes[project] = project_minutes.get(project, 0.0) + minutes
     last_entry_time = end
 
     labels = [task_label(t) + (" ✓" if t in done else "") for t in worked]
     labels += [task_label(t) + " ✓" for t in done if t not in worked]
     tasks_text = ", ".join(labels)
+    log_projects = []
+    for project, _t, _m in shares:
+        if project and project != NONPROJECT and project not in log_projects:
+            log_projects.append(project)
 
-    saved_log = save_with_retry("daily log", write_entry,
-                                start, end, answer, projects, kind, tasks_text)
-    save_with_retry("weekly CSV", write_csv_rows,
-                    start, end, answer, projects, kind, tasks_text)
-    if not saved_log and answer.strip():
+    saved_csv = save_with_retry("monthly CSV", write_csv_rows,
+                                start, end, answer, kind, shares)
+    save_with_retry("daily log", write_entry,
+                    start, end, answer, log_projects, kind, tasks_text)
+    if not saved_csv:
         # Don't lose what was typed. (Ctrl+C copies a message box's text.)
         messagebox.showwarning(
-            "Work-log", "This entry was NOT saved to the daily log:\n\n"
-                        f"{hhmm(start)}–{hhmm(end)}  {answer}")
+            "Work-log", "This entry was NOT saved:\n\n"
+                        f"{hhmm(start)}\u2013{hhmm(end)}  "
+                        f"{', '.join(log_projects)}  {answer}")
     for t in done:
         log_task_event("DONE", t, f" (total {fmt_hm(task_total_minutes(t))})")
     refresh_task_window()
@@ -1307,6 +1372,271 @@ def show_task_window():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Monthly report (Excel)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def read_month(year, month):
+    """The rows of a month's CSV, with Hours as a number and Day as a date."""
+    path = csv_path_for(datetime(year, month, 1))
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            raw = list(csv.DictReader(f, delimiter=CSV_DELIMITER))
+    except FileNotFoundError:
+        return []
+    rows = []
+    for r in raw:
+        try:
+            hours = float((r.get("Hours") or "0").replace(",", "."))
+            day = datetime.strptime(r.get("Date") or "", "%Y-%m-%d").date()
+        except ValueError:
+            continue                    # skip a damaged line
+        rows.append(dict(r, Hours=hours, Day=day))
+    return rows
+
+
+def report_months():
+    """Months that have a CSV, newest first, as (year, month)."""
+    try:
+        names = os.listdir(LOG_DIR)
+    except OSError:
+        return []
+    months = set()
+    for name in names:
+        if (name.startswith("worklog_") and name.endswith(".csv")
+                and len(name) == len("worklog_2026-10.csv")):
+            try:
+                d = datetime.strptime(name[8:15], "%Y-%m")
+            except ValueError:
+                continue
+            months.add((d.year, d.month))
+    return sorted(months, reverse=True)
+
+
+def create_report(year, month):
+    """Build the Excel report for a month and return its path, or None if the
+    month has no entries. Sheets: Summary (1st–15th, 16th–end and the whole
+    month: time, hours per project and per task), Days, Weeks and Data."""
+    import calendar
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    rows = read_month(year, month)
+    if not rows:
+        return None
+    first = datetime(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    mon = first.strftime("%b")
+    periods = [(f"1–15 {mon}", lambda d: d.day <= 15),
+               (f"16–{last_day} {mon}", lambda d: d.day > 15),
+               (first.strftime("%B %Y"), lambda d: True)]
+    tasks_by_id = {t["ID"]: t for t in load_tasks()}
+    worked_types = ("Work", "Non-project")
+
+    bold, title = Font(bold=True), Font(bold=True, size=14)
+    fill = PatternFill("solid", fgColor="DDE6F4")
+    HOURS = "0.00"
+
+    def header(ws, r, values):
+        for c, v in enumerate(values, 1):
+            cell = ws.cell(r, c, v)
+            cell.font, cell.fill = bold, fill
+
+    def put_row(ws, r, values, font=None):
+        for c, v in enumerate(values, 1):
+            cell = ws.cell(r, c, v)
+            if isinstance(v, float):
+                cell.number_format = HOURS
+            if font:
+                cell.font = font
+
+    def hours(match, period):
+        return sum(x["Hours"] for x in rows if match(x) and period(x["Day"]))
+
+    def widths(ws, values):
+        for c, w in enumerate(values, 1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+
+    wb = Workbook()
+
+    # ── Summary ──
+    ws = wb.active
+    ws.title = "Summary"
+    ws["A1"] = "Work log — " + first.strftime("%B %Y")
+    ws["A1"].font = title
+    r = 3
+    header(ws, r, ["Time (hours)"] + [p for p, _ in periods])
+    lines = [
+        ("Worked (excl. breaks)", lambda x: x["Type"] in worked_types),
+        ("   on projects", lambda x: x["Type"] == "Work"),
+        ("   non-project work", lambda x: x["Type"] == "Non-project"),
+        ("Breaks", lambda x: x["Type"] == "Break"),
+    ]
+    for label, match in lines:
+        r += 1
+        put_row(ws, r, [label] + [hours(match, p) for _, p in periods],
+                bold if r == 4 else None)
+    r += 1
+    put_row(ws, r, ["Days worked"] + [
+        len({x["Day"] for x in rows if x["Type"] in worked_types and p(x["Day"])})
+        for _, p in periods])
+
+    r += 2
+    header(ws, r, ["Hours per project"] + [p for p, _ in periods])
+    projects = sorted({x["Project"] for x in rows if x["Type"] in worked_types},
+                      key=lambda name: -hours(
+                          lambda x, n=name: x["Project"] == n, lambda d: True))
+    for name in projects:
+        r += 1
+        put_row(ws, r, [name] + [
+            hours(lambda x, n=name: x["Project"] == n
+                  and x["Type"] in worked_types, p) for _, p in periods])
+    r += 1
+    put_row(ws, r, ["Total"] + [
+        hours(lambda x: x["Type"] in worked_types, p) for _, p in periods], bold)
+
+    r += 2
+    header(ws, r, ["Hours per task", "Project"] + [p for p, _ in periods]
+           + ["Status"])
+    task_ids = sorted({x["Task_ID"] for x in rows if x.get("Task_ID")},
+                      key=lambda i: -hours(lambda x, i=i: x["Task_ID"] == i,
+                                           lambda d: True))
+    for tid in task_ids:
+        sample = next(x for x in rows if x["Task_ID"] == tid)
+        t = tasks_by_id.get(tid)
+        if t is None:
+            status = "deleted"
+        elif t["Status"] == "done":
+            status = f"done {t['Done']}"
+        else:
+            status = f"open (due {t['Due']})" if t["Due"] else "open"
+        r += 1
+        put_row(ws, r, [f"{tid} {sample['Task']}",
+                        t["Project"] if t else sample["Project"]]
+                + [hours(lambda x, i=tid: x["Task_ID"] == i, p)
+                   for _, p in periods] + [status])
+    if not task_ids:
+        r += 1
+        ws.cell(r, 1, "(no task time this month)")
+    widths(ws, [34, 18, 16, 16, 18, 22])
+
+    # ── Days ──
+    ws = wb.create_sheet("Days")
+    header(ws, 1, ["Date", "Weekday", "Start", "End", "Worked h", "Breaks h",
+                   "Projects"])
+    for i, day in enumerate(sorted({x["Day"] for x in rows}), 2):
+        of_day = [x for x in rows if x["Day"] == day]
+        names = []
+        for x in of_day:
+            if x["Type"] == "Work" and x["Project"] not in names:
+                names.append(x["Project"])
+        put_row(ws, i, [day, day.strftime("%a"),
+                        min(x["Start"] for x in of_day),
+                        max(x["End"] for x in of_day),
+                        sum(x["Hours"] for x in of_day
+                            if x["Type"] in worked_types),
+                        sum(x["Hours"] for x in of_day if x["Type"] == "Break"),
+                        ", ".join(names)])
+        ws.cell(i, 1).number_format = "yyyy-mm-dd"
+    ws.freeze_panes = "A2"
+    widths(ws, [12, 9, 7, 7, 10, 10, 40])
+
+    # ── Weeks: hours per project per ISO week ──
+    ws = wb.create_sheet("Weeks")
+    weeks = sorted({x["Week"] for x in rows})
+    header(ws, 1, ["Project"] + weeks + ["Total"])
+    for i, name in enumerate(projects, 2):
+        mine = [x for x in rows if x["Project"] == name
+                and x["Type"] in worked_types]
+        put_row(ws, i, [name] + [sum(x["Hours"] for x in mine
+                                     if x["Week"] == w) for w in weeks]
+                + [sum(x["Hours"] for x in mine)])
+    put_row(ws, len(projects) + 2, ["Total"] + [
+        sum(x["Hours"] for x in rows if x["Week"] == w
+            and x["Type"] in worked_types) for w in weeks]
+        + [sum(x["Hours"] for x in rows if x["Type"] in worked_types)], bold)
+    ws.freeze_panes = "B2"
+    widths(ws, [30] + [11] * (len(weeks) + 1))
+
+    # ── Data: every row, filterable ──
+    ws = wb.create_sheet("Data")
+    header(ws, 1, CSV_HEADERS)
+    for i, x in enumerate(rows, 2):
+        put_row(ws, i, [x["Day"], x.get("Week", ""), x.get("Weekday", ""),
+                        x.get("Start", ""), x.get("End", ""), x["Hours"],
+                        x.get("Type", ""), x.get("Project", ""),
+                        x.get("Task_ID", ""), x.get("Task", ""),
+                        x.get("Note", "")])
+        ws.cell(i, 1).number_format = "yyyy-mm-dd"
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(CSV_HEADERS))}{len(rows) + 1}"
+    widths(ws, [12, 10, 8, 7, 7, 8, 12, 24, 8, 30, 50])
+
+    path = os.path.join(LOG_DIR, f"report_{year}-{month:02d}.xlsx")
+    try:
+        wb.save(path)
+    except PermissionError:
+        # Last report still open in Excel: save next to it under a new name.
+        path = path[:-5] + now().strftime("_%H%M%S") + ".xlsx"
+        wb.save(path)
+    return path
+
+
+def report_dialog():
+    """Ask which month to report on, then build the report and open it."""
+    months = report_months()
+    if not months:
+        messagebox.showinfo("Work-log", "There's nothing to report yet.")
+        return
+    labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
+
+    dlg = tk.Toplevel(root)
+    dlg.title("Work-log — Report")
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+    tk.Label(dlg, text="Create a report for:").grid(
+        row=0, column=0, sticky="w", padx=(14, 6), pady=14)
+    cb = ttk.Combobox(dlg, values=labels, state="readonly", width=18)
+    cb.current(0)
+    cb.grid(row=0, column=1, sticky="w", padx=(0, 14), pady=14)
+    chosen = {}
+
+    def create():
+        chosen["month"] = months[cb.current()]
+        dlg.destroy()
+
+    btns = tk.Frame(dlg)
+    btns.grid(row=1, column=0, columnspan=2, sticky="e", padx=14, pady=(0, 14))
+    ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left",
+                                                              padx=(0, 6))
+    ttk.Button(btns, text="Create", command=create).pack(side="left")
+    dlg.bind("<Return>", lambda e: create())
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+    dlg.update_idletasks()
+    w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+    sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+    dlg.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+    dlg.focus_force()
+    root.wait_window(dlg)
+    if not chosen:
+        return
+
+    try:
+        path = create_report(*chosen["month"])
+    except ImportError:
+        messagebox.showerror("Work-log", "Reports need the openpyxl package:\n"
+                                         "    pip install openpyxl")
+        return
+    except OSError as e:
+        messagebox.showerror("Work-log", f"Couldn't create the report:\n{e}")
+        return
+    if path is None:
+        messagebox.showinfo("Work-log", "That month has no entries.")
+    else:
+        open_path(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tray menu callbacks — these run on pystray's THREAD, so they only enqueue.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1381,8 +1711,9 @@ def build_tray_icon():
             MenuItem("Open task list in Excel", tray_command("tasks_excel")),
         )),
         Menu.SEPARATOR,
-        MenuItem("Open today's log", tray_open_log),
-        MenuItem("Open this week's CSV", tray_open_csv),
+        MenuItem("Create report…", tray_command("report")),
+        MenuItem("Open this month's CSV", tray_open_csv),
+        MenuItem("Open today's log", tray_open_log, visible=WRITE_DAILY_LOG),
         MenuItem("Open log folder", tray_open_folder),
         Menu.SEPARATOR,
         MenuItem("Quit", tray_quit),
@@ -1461,6 +1792,8 @@ def poll_step():
             show_task_window()
         elif name == "tasks_excel":
             open_tasks_in_excel()
+        elif name == "report":
+            report_dialog()
         elif name == "open":
             open_path(cmd[1])
         elif name == "quit":

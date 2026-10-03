@@ -34,7 +34,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PyInstaller and dependencies
-        run: python -m pip install --upgrade pip pyinstaller pystray pillow
+        run: python -m pip install --upgrade pip pyinstaller pystray pillow openpyxl
 
       # --noconsole: it's a tray app with pop-ups, so no console window.
       # pystray picks its backend at runtime, so name the Windows one.
