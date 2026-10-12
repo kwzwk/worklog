@@ -15,9 +15,11 @@ DAILY LOG (optional, see WRITE_DAILY_LOG): a readable Markdown .txt diary per
 day with a work-day summary at the end.
     Entry format:   * HH:MM–HH:MM - Project Name - Entry text
 
-NEW DAY: when the date changes, the day is closed automatically at your last
-activity (so a forgotten evening isn't counted as work) and a new day's log is
-started at your first activity the next morning.
+NEW DAY: the first time you unlock the screen on a new day, that day's log and
+the interval timer start (see START_ON_UNLOCK). After END_OF_DAY, locking the
+screen, the PC sleeping or being away closes the day at your last activity;
+waking/unlocking afterwards asks "Still working?". When the date changes, an
+open day is closed automatically at your last activity.
 
 AWAY: after IDLE_MINUTES without keyboard/mouse input you count as away (no
 prompts). When you're back you're asked whether the time was a break.
@@ -119,6 +121,22 @@ RESET_TIMER_ON_MANUAL_LOG = True
 # was a break. (Uses Windows' last-input time; elsewhere it's switched off.)
 IDLE_MINUTES = 30
 
+# START OF DAY: the first time you unlock the screen on a new day, the day and
+# the interval timer start (your PC can run 24/7; nothing is logged overnight).
+# Windows only; if the unlock notification isn't available, your first
+# keyboard/mouse activity starts the day instead.
+START_ON_UNLOCK = True
+
+# Don't start a day automatically on Saturday / Sunday. You can still start one
+# from the tray ("Start day now") or by logging something.
+WEEKDAYS_ONLY = True
+
+# END OF DAY: after this time, locking the screen, the PC going to sleep, or
+# being away for IDLE_MINUTES closes the day at your last activity (instead of
+# asking about a break) and stops the prompts. When the PC wakes up / is
+# unlocked afterwards you're asked "Still working?".
+END_OF_DAY = dtime(17, 0)
+
 # Monthly CSVs, reports and daily logs go in a "log" subfolder next to the
 # program.
 LOG_DIR = os.path.join(BASE_DIR, "log")
@@ -201,6 +219,12 @@ rolling_over = False         # guard: closing the day is in progress
 last_active = None           # last moment you were known to be at the PC
 away_since = None            # start of the current away period, or None
 last_poll = None             # previous poll time, to notice the PC sleeping
+
+# Start / end of day.
+last_session_date = None     # date of the most recently started day
+evening_closed_date = None   # date of a day closed after END_OF_DAY, else None
+alive_pending = False        # PC woke / unlocked after that: ask "Still working?"
+session_events_ok = False    # True when Windows lock/unlock/sleep events work
 
 # Commands from the tray thread → main (Tk) thread. The tray menu callbacks run
 # on pystray's own thread, so they must NOT touch Tk directly; they enqueue a
@@ -930,21 +954,28 @@ def log_block(start, end, answer, projects, kind, task_ids=(), done_ids=()):
 # Sessions: one per day
 # ─────────────────────────────────────────────────────────────────────────────
 
-def start_session(start):
-    """Start a day's session: its own log file, fresh totals and countdown."""
+def start_session(start, resume=False):
+    """Start a day's session: its own log file, fresh totals and countdown.
+    With resume=True (still working after the day was closed in the evening)
+    the day's totals carry on instead of starting from zero."""
     global LOG_PATH, session_start, session_active, last_entry_time, last_active
     global nonproject_minutes, break_minutes, entries_count, next_due, away_since
-    global last_poll
+    global last_poll, last_session_date, evening_closed_date, alive_pending
 
     LOG_PATH = log_path_for(start)
-    session_start = last_entry_time = last_active = last_poll = start
-    project_minutes.clear()
-    task_minutes.clear()
-    del tasks_done_today[:]
-    nonproject_minutes = 0.0
-    break_minutes = 0.0
-    entries_count = 0
+    if not resume:
+        session_start = start
+        project_minutes.clear()
+        task_minutes.clear()
+        del tasks_done_today[:]
+        nonproject_minutes = 0.0
+        break_minutes = 0.0
+        entries_count = 0
+    last_entry_time = last_active = last_poll = start
     away_since = None
+    last_session_date = start.date()
+    evening_closed_date = None
+    alive_pending = False
     next_due = start + interval
     session_active = True
     save_with_retry("daily log", write_session_header)
@@ -955,6 +986,57 @@ def ensure_session():
     task before the first automatic start of the day)."""
     if not session_active and not quitting:
         start_session(now())
+
+
+def close_evening(note, ask=False):
+    """After END_OF_DAY you locked the screen, the PC went to sleep or you were
+    away: close the day at your last activity and stop the prompts. ask=True:
+    the PC just woke up, so ask "Still working?" at your next input."""
+    global away_since, evening_closed_date, alive_pending
+    if not session_active or rolling_over:
+        return
+    end = away_since if away_since is not None else last_active
+    midnight = datetime.combine(session_start.date() + timedelta(days=1),
+                                dtime.min)
+    end = min(max(end, last_entry_time), midnight, now())
+    close_active_dialog()
+    away_since = None
+    end_session(end, note)
+    evening_closed_date = session_start.date()
+    alive_pending = ask
+
+
+def after_end_of_day(t=None):
+    t = t or now()
+    return t.date() == session_start.date() and t.time() >= END_OF_DAY
+
+
+def day_may_auto_start(t):
+    return not (WEEKDAYS_ONLY and t.weekday() >= 5)
+
+
+def on_unlock(ts):
+    """The screen was unlocked (or the PC woke up). Starts today's day on the
+    first unlock; after an evening close it asks whether you're still working."""
+    global alive_pending
+    if session_active or quitting:
+        return
+    if evening_closed_date == ts.date():
+        alive_pending = True
+    elif (START_ON_UNLOCK and last_session_date != ts.date()
+            and day_may_auto_start(ts)):
+        start_session(ts)
+
+
+def ask_still_working():
+    """Wake-up / unlock after the evening close: are you still there?"""
+    global alive_pending
+    alive_pending = False
+    if messagebox.askyesno(
+            "Work-log",
+            "The day was closed this evening.\n\nAre you still working? "
+            "Yes starts a new block from now."):
+        start_session(now(), resume=True)
 
 
 def build_summary(end):
@@ -1067,6 +1149,12 @@ def update_activity():
              and t - last_poll > timedelta(minutes=IDLE_MINUTES))
     last_poll = t
     if away_since is not None:
+        return
+    # After END_OF_DAY, going away (or sleeping) ends the day: no break dialog.
+    if (session_active and not paused and not rolling_over
+            and after_end_of_day(t)
+            and (slept or idle >= IDLE_MINUTES * 60)):
+        close_evening("closed after end of day", ask=slept)
         return
     # While paused you're never counted as away, but your last activity is
     # still tracked so the day closes at the right time.
@@ -1644,6 +1732,10 @@ def tray_log_now(_icon=None, _item=None):
     cmd_q.put(("log",))
 
 
+def tray_start_day(_icon=None, _item=None):
+    cmd_q.put(("start_day",))
+
+
 def tray_toggle_pause(_icon=None, _item=None):
     cmd_q.put(("toggle_pause",))
 
@@ -1701,6 +1793,8 @@ def build_tray_icon():
 
     menu = Menu(
         MenuItem("Log now", tray_log_now, default=True),
+        MenuItem("Start day now", tray_start_day,
+                 visible=lambda item: not session_active),
         MenuItem("Pause auto-prompts", tray_toggle_pause,
                  checked=lambda item: paused),
         MenuItem("Interval", Menu(*interval_items)),
@@ -1719,6 +1813,105 @@ def build_tray_icon():
         MenuItem("Quit", tray_quit),
     )
     return pystray.Icon("worklog", img, "Work-log", menu=menu)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lock / unlock / sleep / wake notifications (Windows)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def session_watcher(ready):
+    """Runs on its own thread: a hidden window that receives Windows' session
+    (lock/unlock) and power (sleep/wake) messages and enqueues them for the
+    main thread. Sets ready[0] = True once registered."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    LRESULT = ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                 wintypes.WPARAM, wintypes.LPARAM)
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE),
+                    ("hIcon", wintypes.HANDLE), ("hCursor", wintypes.HANDLE),
+                    ("hbrBackground", wintypes.HANDLE),
+                    ("lpszMenuName", wintypes.LPCWSTR),
+                    ("lpszClassName", wintypes.LPCWSTR)]
+
+    user32.DefWindowProcW.restype = LRESULT
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
+    WM_POWERBROADCAST, WM_WTSSESSION_CHANGE = 0x0218, 0x02B1
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK = 7, 8
+    PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND = 4, 0x12, 7
+
+    def wndproc(hwnd, msg, wparam, lparam):
+        try:
+            if msg == WM_WTSSESSION_CHANGE:
+                if wparam == WTS_SESSION_LOCK:
+                    cmd_q.put(("lock", now()))
+                elif wparam == WTS_SESSION_UNLOCK:
+                    cmd_q.put(("unlock", now()))
+            elif msg == WM_POWERBROADCAST:
+                if wparam == PBT_APMSUSPEND:
+                    cmd_q.put(("suspend", now()))
+                elif wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                    cmd_q.put(("resume", now()))
+        except Exception:
+            pass
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    proc = WNDPROC(wndproc)             # keep a reference so it isn't freed
+    cls = WNDCLASSW()
+    cls.lpfnWndProc = proc
+    cls.hInstance = kernel32.GetModuleHandleW(None)
+    cls.lpszClassName = "WorklogSessionWatcher"
+    user32.RegisterClassW(ctypes.byref(cls))
+    # A normal (never shown) top-level window: message-only windows don't get
+    # the power broadcast messages.
+    hwnd = user32.CreateWindowExW(0, cls.lpszClassName, "Work-log", 0,
+                                  0, 0, 0, 0, None, None, cls.hInstance, None)
+    if not hwnd:
+        return
+    if not ctypes.windll.wtsapi32.WTSRegisterSessionNotification(hwnd, 0):
+        return
+    ready[0] = True
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
+
+def start_session_watcher():
+    """Start the watcher thread; report whether the notifications work."""
+    global session_events_ok
+    if os.name != "nt":
+        return
+    ready = [False]
+
+    def run():
+        try:
+            session_watcher(ready)
+        except Exception:
+            ready[0] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    for _ in range(40):                 # wait up to ~2 s for the registration
+        if ready[0]:
+            break
+        threading.Event().wait(0.05)
+    session_events_ok = ready[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1776,6 +1969,19 @@ def poll_step():
             do_prompt("manual")
             if RESET_TIMER_ON_MANUAL_LOG:
                 next_due = now() + interval
+        elif name == "start_day":
+            if not session_active:
+                start_session(now())
+        elif name == "unlock":
+            on_unlock(cmd[1])
+        elif name == "lock":
+            if session_active and not paused and after_end_of_day(cmd[1]):
+                close_evening("screen locked after end of day")
+        elif name == "suspend":
+            if session_active and not paused and after_end_of_day(cmd[1]):
+                close_evening("PC went to sleep after end of day")
+        elif name == "resume":
+            on_unlock(cmd[1])
         elif name == "toggle_pause":
             paused = not paused
             if not paused:
@@ -1800,14 +2006,24 @@ def poll_step():
             finalize_and_quit()
             return False
 
-    # 2) After a day was closed: start the new day at your first activity.
+    # 2) After a day was closed: ask "Still working?" after an evening close,
+    #    else start the new day (on unlock, or at your first activity when the
+    #    unlock notification isn't available).
     if not session_active:
-        if idle_seconds() < 60:
-            start_session(now())
+        t = now()
+        if evening_closed_date == t.date():
+            if alive_pending and idle_seconds() < 10:
+                ask_still_working()
+        elif (not (START_ON_UNLOCK and session_events_ok)
+                and last_session_date != t.date()
+                and day_may_auto_start(t) and idle_seconds() < 60):
+            start_session(t)
         return True
 
     # 3) Away detection, and closing the day when the date changes.
     update_activity()
+    if not session_active:
+        return True                      # the day was just closed (evening)
     if now().date() != session_start.date():
         roll_over_day()
         return True
@@ -1843,6 +2059,7 @@ def main():
     interval_minutes = INTERVAL_MINUTES
     interval = timedelta(minutes=interval_minutes)
     start_session(now())
+    start_session_watcher()
 
     # Start the tray icon on its own thread (its menu callbacks just enqueue).
     icon = build_tray_icon()
